@@ -21,17 +21,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Components
-db = Database(settings.DB_PATH)
-detector = AnomalyDetector(
-    threshold_percent=settings.ANOMALY_THRESHOLD_PERCENT,
-    z_score_threshold=settings.ANOMALY_Z_SCORE_THRESHOLD,
-)
-notifier = TelegramNotifier(settings.TELEGRAM_BOT_TOKEN, settings.TELEGRAM_CHAT_ID)
+
+def _create_components():
+    """Create components lazily (not at import time) so env vars are ready."""
+    db = Database(settings.DB_PATH)
+    detector = AnomalyDetector(
+        threshold_percent=settings.ANOMALY_THRESHOLD_PERCENT,
+        z_score_threshold=settings.ANOMALY_Z_SCORE_THRESHOLD,
+    )
+    notifier = TelegramNotifier(settings.TELEGRAM_BOT_TOKEN, settings.TELEGRAM_CHAT_ID)
+    return db, detector, notifier
 
 
 async def scan_wildberries() -> list[Product]:
-    """Scan ALL Wildberries categories by discount and by cheapest price."""
     parser = WildberriesParser(
         dest=settings.WB_DEST,
         max_categories=settings.WB_MAX_CATEGORIES,
@@ -45,7 +47,6 @@ async def scan_wildberries() -> list[Product]:
 
 
 async def scan_ozon() -> list[Product]:
-    """Scan ALL Ozon categories by discount and by cheapest price."""
     parser = OzonParser(max_categories=settings.OZON_MAX_CATEGORIES)
     try:
         return await parser.scan_all_categories(
@@ -55,12 +56,10 @@ async def scan_ozon() -> list[Product]:
         await parser.close()
 
 
-async def scan_cycle():
-    """Main scan cycle: fetch, detect, cross-compare, notify."""
+async def scan_cycle(db: Database, detector: AnomalyDetector, notifier: TelegramNotifier):
     started_at = datetime.now()
     logger.info("=== Scan cycle started ===")
 
-    # 1. Fetch products from both marketplaces concurrently
     try:
         wb_products, ozon_products = await asyncio.gather(
             scan_wildberries(),
@@ -90,7 +89,6 @@ async def scan_cycle():
 
     logger.info("Total products: %d", len(all_products))
 
-    # 2. Save prices to history
     price_dicts = [
         {
             "source": p.source,
@@ -104,26 +102,19 @@ async def scan_cycle():
     ]
     await db.save_prices(price_dicts)
 
-    # 3. Load price history for z-score analysis
     price_history = await db.get_price_history()
-
-    # 4. Detect anomalies (includes cross-marketplace comparison)
     anomalies = detector.detect(all_products, price_history)
     logger.info("Anomalies detected: %d", len(anomalies))
 
-    # 5. Filter already-notified and send alerts
     notifications_sent = 0
     for anomaly in anomalies:
         p = anomaly.product
-
         if await db.was_notified(p.source, p.product_id, p.sale_price):
             continue
-
         await notifier.send_anomaly(anomaly)
         await db.mark_notified(p.source, p.product_id, p.sale_price)
         notifications_sent += 1
 
-    # 6. Save scan stats
     finished_at = datetime.now()
     await db.save_scan_run(
         started_at=started_at,
@@ -135,31 +126,32 @@ async def scan_cycle():
 
     logger.info(
         "=== Scan complete: %d scanned, %d anomalies, %d notified ===",
-        len(all_products),
-        len(anomalies),
-        notifications_sent,
+        len(all_products), len(anomalies), notifications_sent,
     )
 
 
 async def run_once():
-    """Single scan cycle for GitHub Actions / cron."""
     logger.info("Starting single scan cycle (all categories)")
+    logger.info("Token: %s...", settings.TELEGRAM_BOT_TOKEN[:10])
+    logger.info("Chat ID: %s", settings.TELEGRAM_CHAT_ID)
+
+    db, detector, notifier = _create_components()
     await db.init()
     try:
-        await scan_cycle()
+        await scan_cycle(db, detector, notifier)
     finally:
         await notifier.close()
         await db.close()
 
 
 async def run_loop():
-    """Continuous mode with scheduler."""
     logger.info("Starting Marketplace Price Anomaly Bot (all categories)")
     logger.info("WB categories: %d, Ozon categories: %d",
                 settings.WB_MAX_CATEGORIES, settings.OZON_MAX_CATEGORIES)
     logger.info("Scan interval: %d minutes", settings.SCAN_INTERVAL_MINUTES)
     logger.info("Anomaly threshold: %.0f%%", settings.ANOMALY_THRESHOLD_PERCENT)
 
+    db, detector, notifier = _create_components()
     await db.init()
 
     try:
@@ -178,10 +170,11 @@ async def run_loop():
     except Exception as e:
         logger.error("Failed to send startup message: %s", e)
 
-    await scan_cycle()
+    await scan_cycle(db, detector, notifier)
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(scan_cycle, "interval", minutes=settings.SCAN_INTERVAL_MINUTES)
+    scheduler.add_job(scan_cycle, "interval", minutes=settings.SCAN_INTERVAL_MINUTES,
+                      args=[db, detector, notifier])
     scheduler.start()
 
     logger.info("Scheduler started, waiting for next cycle...")

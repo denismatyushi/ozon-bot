@@ -21,12 +21,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ hashFiles('pyproject.toml') }}
-
       - name: Install dependencies
         run: pip install aiohttp aiogram pydantic pydantic-settings aiosqlite "apscheduler>=3.10,<4.0" python-dotenv
 
@@ -36,6 +30,21 @@ jobs:
           path: data/prices.db
           key: price-db-${{ github.run_id }}
           restore-keys: price-db-
+
+      - name: Check secrets are set
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN secret is empty! Go to Settings -> Secrets -> Actions and add it."
+            exit 1
+          fi
+          if [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "::error::TELEGRAM_CHAT_ID secret is empty! Go to Settings -> Secrets -> Actions and add it."
+            exit 1
+          fi
+          echo "Secrets OK (token starts with ${TELEGRAM_BOT_TOKEN:0:5}...)"
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Run full category scan
         env:
