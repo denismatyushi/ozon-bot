@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 from datetime import datetime
 
@@ -15,12 +16,24 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/134.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Connection": "keep-alive",
+    "sec-ch-ua": '"Chromium";v="134", "Google Chrome";v="134", "Not:A-Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
 }
+
+MAX_RETRIES = 3
 
 # Popular Ozon categories
 OZON_CATEGORIES = [
@@ -61,8 +74,24 @@ class OzonParser(BaseParser):
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(headers=HEADERS)
+            jar = aiohttp.CookieJar()
+            self._session = aiohttp.ClientSession(headers=HEADERS, cookie_jar=jar)
+            await self._warmup_session()
         return self._session
+
+    async def _warmup_session(self) -> None:
+        """Visit the main page to obtain session cookies."""
+        try:
+            async with self._session.get(
+                "https://www.ozon.ru/",
+                timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
+            ) as resp:
+                await resp.read()
+                logger.info("Ozon session warmup: status %d, cookies: %d",
+                            resp.status, len(self._session.cookie_jar))
+        except Exception as e:
+            logger.warning("Ozon warmup failed: %s", e)
 
     async def scan_all_categories(self, pages_per_category: int = 1) -> list[Product]:
         """Browse Ozon categories by discount and by cheapest price."""
@@ -80,7 +109,7 @@ class OzonParser(BaseParser):
                 if p.product_id not in all_products:
                     all_products[p.product_id] = p
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(random.uniform(2, 4))
 
         return list(all_products.values())
 
@@ -103,29 +132,48 @@ class OzonParser(BaseParser):
 
             if not page_products:
                 break
-            await asyncio.sleep(3)
+            await asyncio.sleep(random.uniform(2, 5))
 
         if products:
             logger.info("Ozon '%s' (sort=%s): %d products", cat_name, sorting, len(products))
         return products
 
     async def _fetch_page(self, session: aiohttp.ClientSession, url: str) -> str | None:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True) as resp:
-                if resp.status == 403:
-                    logger.warning("Ozon blocked request (403)")
-                    return None
-                if resp.status == 429:
-                    logger.warning("Ozon rate limited, waiting 10s...")
-                    await asyncio.sleep(10)
-                    return None
-                if resp.status != 200:
-                    logger.error("Ozon error: status %d for %s", resp.status, url)
-                    return None
-                return await resp.text()
-        except Exception as e:
-            logger.error("Ozon request failed: %s", e)
-            return None
+        for attempt in range(MAX_RETRIES):
+            try:
+                extra_headers = {"Referer": "https://www.ozon.ru/"}
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=25),
+                    allow_redirects=True,
+                    headers=extra_headers,
+                ) as resp:
+                    if resp.status == 403:
+                        wait = (2 ** attempt) + random.uniform(1, 3)
+                        logger.warning(
+                            "Ozon 403 (attempt %d/%d), retrying in %.1fs",
+                            attempt + 1, MAX_RETRIES, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status == 429:
+                        wait = 10 + random.uniform(2, 5)
+                        logger.warning("Ozon rate limited, waiting %.1fs...", wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status != 200:
+                        logger.error("Ozon error: status %d for %s", resp.status, url)
+                        return None
+                    return await resp.text()
+            except Exception as e:
+                logger.error("Ozon request failed: %s", e)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return None
+
+        logger.warning("Ozon: all %d retries exhausted for %s", MAX_RETRIES, url)
+        return None
 
     # ── HTML extraction ─────────────────────────────────────────
 
