@@ -1,0 +1,55 @@
+name: Price Anomaly Scanner
+
+on:
+  # Run every 15 minutes automatically
+  schedule:
+    - cron: "*/15 * * * *"
+
+  # Also run on any push (so it starts immediately after deploy)
+  push:
+    branches: ["*"]
+
+  # Manual trigger button in GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install dependencies
+        run: pip install aiohttp aiogram pydantic pydantic-settings aiosqlite "apscheduler>=3.10,<4.0" python-dotenv
+
+      # Restore the SQLite database from previous runs
+      # so z-score anomaly detection has history
+      - name: Restore price history DB
+        uses: actions/cache@v4
+        with:
+          path: data/prices.db
+          key: price-db-${{ github.ref_name }}
+          restore-keys: price-db-
+
+      - name: Run single scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WB_SEARCH_QUERIES: ${{ secrets.WB_SEARCH_QUERIES }}
+          OZON_SEARCH_QUERIES: ${{ secrets.OZON_SEARCH_QUERIES }}
+          ANOMALY_THRESHOLD_PERCENT: "60"
+          SCAN_INTERVAL_MINUTES: "15"
+          CROSSREF_ENABLED: "false"
+          LOG_LEVEL: "INFO"
+        run: python -m src.main --once

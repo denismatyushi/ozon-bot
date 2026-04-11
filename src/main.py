@@ -158,7 +158,24 @@ async def scan_cycle():
     )
 
 
-async def main():
+async def run_once():
+    """Single scan cycle for GitHub Actions / cron usage."""
+    logger.info("Starting single scan cycle")
+    logger.info("Anomaly threshold: %.0f%%", settings.ANOMALY_THRESHOLD_PERCENT)
+    logger.info("WB queries: %s", settings.wb_queries_list)
+    logger.info("Ozon queries: %s", settings.ozon_queries_list)
+
+    await db.init()
+    try:
+        await scan_cycle()
+    finally:
+        await crossref.close()
+        await notifier.close()
+        await db.close()
+
+
+async def run_loop():
+    """Continuous mode with scheduler for local / Codespaces usage."""
     logger.info("Starting Marketplace Price Anomaly Bot")
     logger.info("Scan interval: %d minutes", settings.SCAN_INTERVAL_MINUTES)
     logger.info("Anomaly threshold: %.0f%%", settings.ANOMALY_THRESHOLD_PERCENT)
@@ -167,7 +184,6 @@ async def main():
 
     await db.init()
 
-    # Send startup message
     try:
         await notifier.bot.send_message(
             chat_id=settings.TELEGRAM_CHAT_ID,
@@ -183,17 +199,14 @@ async def main():
     except Exception as e:
         logger.error("Failed to send startup message: %s", e)
 
-    # Run first scan immediately
     await scan_cycle()
 
-    # Schedule periodic scans
     scheduler = AsyncIOScheduler()
     scheduler.add_job(scan_cycle, "interval", minutes=settings.SCAN_INTERVAL_MINUTES)
     scheduler.start()
 
     logger.info("Scheduler started, waiting for next cycle...")
 
-    # Keep running
     try:
         while True:
             await asyncio.sleep(60)
@@ -207,4 +220,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    mode = sys.argv[1] if len(sys.argv) > 1 else "loop"
+    if mode == "--once":
+        asyncio.run(run_once())
+    else:
+        asyncio.run(run_loop())
