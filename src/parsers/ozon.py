@@ -4,6 +4,7 @@ import logging
 import random
 import re
 from datetime import datetime
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
@@ -14,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 
-# Popular Ozon categories
 OZON_CATEGORIES = [
     {"id": "15500", "name": "Elektronika", "slug": "elektronika"},
     {"id": "15548", "name": "Smartfony", "slug": "smartfony"},
@@ -43,7 +43,6 @@ OZON_CATEGORIES = [
     {"id": "15678", "name": "Pylososy", "slug": "pylososy-15678"},
 ]
 
-# Stealth script to hide automation markers from anti-bot systems
 _STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru', 'en-US', 'en']});
@@ -57,32 +56,54 @@ window.navigator.permissions.query = (parameters) =>
 """
 
 
-class OzonParser(BaseParser):
-    """Ozon parser — uses Playwright (real Chromium) to bypass JS-based anti-bot."""
+def _parse_proxy_url(proxy_url: str) -> dict:
+    """Convert proxy URL to Playwright proxy config."""
+    parsed = urlparse(proxy_url)
+    config: dict = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        config["username"] = parsed.username
+    if parsed.password:
+        config["password"] = parsed.password
+    return config
 
-    def __init__(self, max_categories: int = 25):
+
+class OzonParser(BaseParser):
+    """Ozon parser — Playwright + proxy to bypass CDN/WAF IP blocking."""
+
+    def __init__(self, max_categories: int = 25, proxy_url: str | None = None):
         self.max_categories = max_categories
+        self._proxy_url = proxy_url
         self._pw = None
         self._browser = None
         self._context = None
         self._page = None
 
     async def _ensure_page(self):
-        """Launch browser and create a persistent page for all requests."""
         if self._page and not self._page.is_closed():
             return self._page
 
-        logger.info("Launching Chromium for Ozon parsing...")
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=True,
-            args=[
+
+        launch_args = {
+            "headless": True,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
             ],
-        )
+        }
+
+        if self._proxy_url:
+            launch_args["proxy"] = _parse_proxy_url(self._proxy_url)
+            logger.info("Ozon: using proxy %s", self._proxy_url.split("@")[-1])
+        else:
+            logger.warning(
+                "Ozon: no proxy configured (OZON_PROXY_URL). "
+                "Ozon blocks cloud IPs — set a proxy with a Russian IP."
+            )
+
+        self._browser = await self._pw.chromium.launch(**launch_args)
         self._context = await self._browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=(
@@ -96,18 +117,26 @@ class OzonParser(BaseParser):
         await self._context.add_init_script(_STEALTH_JS)
         self._page = await self._context.new_page()
 
-        # Warmup: visit main page to establish cookies / pass JS challenge
+        # Warmup: visit main page, pass JS challenge, get cookies
         try:
-            await self._page.goto(
+            resp = await self._page.goto(
                 "https://www.ozon.ru/",
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
             await self._page.wait_for_timeout(3000)
             cookies = await self._context.cookies()
-            logger.info("Ozon browser ready, cookies: %d", len(cookies))
+            logger.info(
+                "Ozon warmup: status=%s, cookies=%d",
+                resp.status if resp else "?", len(cookies),
+            )
+            if resp and resp.status == 403:
+                logger.error(
+                    "Ozon warmup got 403 — the IP is blocked. "
+                    "Set OZON_PROXY_URL to a proxy with a Russian IP."
+                )
         except Exception as exc:
-            logger.warning("Ozon warmup navigation failed: %s", exc)
+            logger.error("Ozon warmup failed: %s", exc)
 
         return self._page
 
@@ -146,43 +175,36 @@ class OzonParser(BaseParser):
             )
             page_products = await self._load_and_extract(url, cat_name)
             products.extend(page_products)
-
             if not page_products:
                 break
             await asyncio.sleep(random.uniform(2, 4))
 
         if products:
-            logger.info(
-                "Ozon '%s' (sort=%s): %d products", cat_name, sorting, len(products)
-            )
+            logger.info("Ozon '%s' (sort=%s): %d products", cat_name, sorting, len(products))
         return products
 
-    # ── Page loading with Playwright ────────────────────────────
+    # ── Page loading ────────────────────────────────────────────
 
     async def _load_and_extract(self, url: str, category: str) -> list[Product]:
-        """Navigate to url, capture API data via interception + rendered HTML."""
         page = await self._ensure_page()
         api_items: list[dict] = []
 
         async def _on_response(response):
-            """Capture product data from Ozon's internal API responses."""
             try:
-                resp_url = response.url
                 if response.status != 200:
                     return
-                content_type = response.headers.get("content-type", "")
-                if "json" not in content_type:
+                ct = response.headers.get("content-type", "")
+                if "json" not in ct:
                     return
+                resp_url = response.url
                 if "composer-api" not in resp_url and "entrypoint-api" not in resp_url:
                     return
                 body = await response.json()
-                widget_states = body.get("widgetStates", {})
-                for key, value in widget_states.items():
+                for key, value in body.get("widgetStates", {}).items():
                     if "searchResultsV2" not in key:
                         continue
                     parsed = json.loads(value) if isinstance(value, str) else value
-                    items = parsed.get("items", [])
-                    api_items.extend(items)
+                    api_items.extend(parsed.get("items", []))
             except Exception:
                 pass
 
@@ -191,7 +213,6 @@ class OzonParser(BaseParser):
             products = await self._navigate_and_collect(page, url, category, api_items)
         finally:
             page.remove_listener("response", _on_response)
-
         return products
 
     async def _navigate_and_collect(
@@ -199,9 +220,7 @@ class OzonParser(BaseParser):
     ) -> list[Product]:
         for attempt in range(MAX_RETRIES):
             try:
-                resp = await page.goto(
-                    url, wait_until="domcontentloaded", timeout=30000
-                )
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
                 if resp and resp.status == 403:
                     wait = (2 ** attempt) + random.uniform(2, 5)
@@ -212,43 +231,33 @@ class OzonParser(BaseParser):
                     await asyncio.sleep(wait)
                     continue
 
-                # Wait for product cards to render (up to 8 s)
                 try:
                     await page.wait_for_selector(
-                        "[data-widget='searchResultsV2']",
-                        timeout=8000,
+                        "[data-widget='searchResultsV2']", timeout=8000
                     )
                 except Exception:
-                    # Widget name may differ — just wait a fixed time
                     await page.wait_for_timeout(3000)
 
-                # ── Extract products ────────────────────────────
-
-                # Method 1: intercepted API JSON (most reliable)
+                # Method 1: intercepted API JSON
                 products: list[Product] = []
                 for item in api_items:
                     p = self._parse_state_item(item, category)
                     if p:
                         products.append(p)
-
                 if products:
                     return products
 
-                # Method 2: parse rendered HTML
+                # Method 2: rendered HTML
                 html = await page.content()
                 products = self._extract_products_from_html(html, category)
                 if products:
                     return products
 
-                # Method 3: evaluate DOM directly
-                products = await self._extract_via_js(page, category)
-                return products
+                # Method 3: DOM evaluation
+                return await self._extract_via_js(page, category)
 
             except Exception as exc:
-                logger.error(
-                    "Ozon page error (attempt %d/%d): %s",
-                    attempt + 1, MAX_RETRIES, exc,
-                )
+                logger.error("Ozon page error (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, exc)
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(random.uniform(2, 4))
                     continue
@@ -257,20 +266,21 @@ class OzonParser(BaseParser):
         logger.warning("Ozon: retries exhausted for %s", url)
         return []
 
-    # ── Extraction helpers ──────────────────────────────────────
+    # ── Extraction ──────────────────────────────────────────────
 
     async def _extract_via_js(self, page, category: str) -> list[Product]:
-        """Extract product data directly from the rendered DOM via JS."""
         try:
             raw = await page.evaluate("""() => {
-                const cards = document.querySelectorAll(
-                    '[data-widget="searchResultsV2"] [data-state]'
-                );
+                const cards = document.querySelectorAll('[data-state]');
                 const results = [];
                 for (const card of cards) {
                     try {
                         const state = JSON.parse(card.getAttribute('data-state'));
-                        if (state && state.id) results.push(state);
+                        if (state && state.items) {
+                            results.push(...state.items);
+                        } else if (state && state.id && state.mainState) {
+                            results.push(state);
+                        }
                     } catch {}
                 }
                 return results;
@@ -287,13 +297,9 @@ class OzonParser(BaseParser):
     def _extract_products_from_html(self, html: str, category: str) -> list[Product]:
         products: list[Product] = []
 
-        json_blocks = re.findall(
-            r'data-state="({[^"]*?searchResultsV2[^"]*?})"', html
-        )
+        json_blocks = re.findall(r'data-state="({[^"]*?searchResultsV2[^"]*?})"', html)
         if not json_blocks:
-            json_blocks = re.findall(
-                r'data-state="({[^"]*?&quot;items&quot;[^"]*?})"', html
-            )
+            json_blocks = re.findall(r'data-state="({[^"]*?&quot;items&quot;[^"]*?})"', html)
 
         for block in json_blocks:
             try:
@@ -304,8 +310,7 @@ class OzonParser(BaseParser):
                     .replace("&gt;", ">")
                 )
                 data = json.loads(block_unescaped)
-                items = data.get("items", [])
-                for item in items:
+                for item in data.get("items", []):
                     product = self._parse_state_item(item, category)
                     if product:
                         products.append(product)
@@ -341,12 +346,8 @@ class OzonParser(BaseParser):
             original_price = 0
 
             for atom in main_state:
-                if (
-                    atom.get("id") == "name" or atom.get("type") == "textAtom"
-                ) and not name:
-                    text = (
-                        atom.get("atom", {}).get("textAtom", {}).get("text", "")
-                    )
+                if (atom.get("id") == "name" or atom.get("type") == "textAtom") and not name:
+                    text = atom.get("atom", {}).get("textAtom", {}).get("text", "")
                     if text:
                         name = text
 
@@ -354,19 +355,11 @@ class OzonParser(BaseParser):
                 if atom.get("type") == "priceV2":
                     price_data = atom.get("atom", {}).get("priceV2", {})
                     price_list = price_data.get("price", [{}])
-                    price_str = (
-                        price_list[0].get("text", "") if price_list else ""
-                    )
+                    price_str = price_list[0].get("text", "") if price_list else ""
                     orig_list = price_data.get("originalPrice", [{}])
-                    orig_str = (
-                        orig_list[0].get("text", "") if orig_list else ""
-                    )
+                    orig_str = orig_list[0].get("text", "") if orig_list else ""
                     sale_price = self._parse_price_string(price_str)
-                    original_price = (
-                        self._parse_price_string(orig_str)
-                        if orig_str
-                        else sale_price
-                    )
+                    original_price = self._parse_price_string(orig_str) if orig_str else sale_price
 
             if not name or sale_price <= 100:
                 return None
@@ -391,9 +384,7 @@ class OzonParser(BaseParser):
         self._find_products_recursive(data, products, category, depth=0)
         return products
 
-    def _find_products_recursive(
-        self, obj, products: list, category: str, depth: int
-    ):
+    def _find_products_recursive(self, obj, products: list, category: str, depth: int):
         if depth > 10:
             return
         if isinstance(obj, dict):
@@ -404,15 +395,11 @@ class OzonParser(BaseParser):
             else:
                 for v in obj.values():
                     if isinstance(v, (dict, list)):
-                        self._find_products_recursive(
-                            v, products, category, depth + 1
-                        )
+                        self._find_products_recursive(v, products, category, depth + 1)
         elif isinstance(obj, list):
             for item in obj:
                 if isinstance(item, (dict, list)):
-                    self._find_products_recursive(
-                        item, products, category, depth + 1
-                    )
+                    self._find_products_recursive(item, products, category, depth + 1)
 
     def _parse_generic_item(self, item: dict, category: str) -> Product | None:
         try:
@@ -422,9 +409,7 @@ class OzonParser(BaseParser):
                 return None
 
             sale_price = item.get("finalPrice", 0) or item.get("price", 0)
-            original_price = item.get("originalPrice", 0) or item.get(
-                "basePrice", 0
-            )
+            original_price = item.get("originalPrice", 0) or item.get("basePrice", 0)
 
             if isinstance(sale_price, str):
                 sale_price = self._parse_price_string(sale_price)
@@ -443,9 +428,7 @@ class OzonParser(BaseParser):
                 source="ozon",
                 product_id=product_id,
                 name=name,
-                original_price=(
-                    original_price if original_price > 0 else sale_price
-                ),
+                original_price=original_price if original_price > 0 else sale_price,
                 sale_price=sale_price,
                 url=f"https://www.ozon.ru/product/{product_id}/",
                 category=category,
@@ -464,27 +447,15 @@ class OzonParser(BaseParser):
         return int(cleaned) * 100
 
     async def close(self) -> None:
-        try:
-            if self._page and not self._page.is_closed():
-                await self._page.close()
-        except Exception:
-            pass
-        try:
-            if self._context:
-                await self._context.close()
-        except Exception:
-            pass
-        try:
-            if self._browser:
-                await self._browser.close()
-        except Exception:
-            pass
+        for resource in (self._page, self._context, self._browser):
+            try:
+                if resource:
+                    await resource.close()
+            except Exception:
+                pass
         try:
             if self._pw:
                 await self._pw.stop()
         except Exception:
             pass
-        self._page = None
-        self._context = None
-        self._browser = None
-        self._pw = None
+        self._page = self._context = self._browser = self._pw = None

@@ -117,6 +117,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OZON_PROXY_URL: ${{ secrets.OZON_PROXY_URL }}
           ANOMALY_THRESHOLD_PERCENT: "60"
           LOG_LEVEL: "INFO"
         run: python -m src.main --once

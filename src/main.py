@@ -47,7 +47,10 @@ async def scan_wildberries() -> list[Product]:
 
 
 async def scan_ozon() -> list[Product]:
-    parser = OzonParser(max_categories=settings.OZON_MAX_CATEGORIES)
+    parser = OzonParser(
+        max_categories=settings.OZON_MAX_CATEGORIES,
+        proxy_url=settings.OZON_PROXY_URL or None,
+    )
     try:
         return await parser.scan_all_categories(
             pages_per_category=settings.OZON_PAGES_PER_CATEGORY,

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     # Ozon
     OZON_MAX_CATEGORIES: int = 25
     OZON_PAGES_PER_CATEGORY: int = 1
+    OZON_PROXY_URL: str = ""  # e.g. socks5://user:pass@host:port or http://host:port
 
     # Anomaly detection
     ANOMALY_THRESHOLD_PERCENT: float = 60.0
