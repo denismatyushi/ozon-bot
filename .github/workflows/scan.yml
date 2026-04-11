@@ -15,7 +15,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -42,14 +42,13 @@ jobs:
           key: price-db-${{ github.ref_name }}
           restore-keys: price-db-
 
-      - name: Run single scan
+      - name: Run full category scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          WB_SEARCH_QUERIES: ${{ secrets.WB_SEARCH_QUERIES }}
-          OZON_SEARCH_QUERIES: ${{ secrets.OZON_SEARCH_QUERIES }}
+          WB_MAX_CATEGORIES: "50"
+          OZON_MAX_CATEGORIES: "25"
           ANOMALY_THRESHOLD_PERCENT: "60"
-          SCAN_INTERVAL_MINUTES: "15"
           CROSSREF_ENABLED: "false"
           LOG_LEVEL: "INFO"
         run: python -m src.main --once

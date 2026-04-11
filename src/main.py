@@ -33,35 +33,28 @@ crossref = CrossRefChecker(serpapi_key=settings.SERPAPI_KEY)
 
 
 async def scan_wildberries() -> list[Product]:
-    """Scan Wildberries for products."""
-    parser = WildberriesParser(dest=settings.WB_DEST)
-    all_products: list[Product] = []
-
+    """Scan ALL Wildberries categories sorted by discount."""
+    parser = WildberriesParser(
+        dest=settings.WB_DEST,
+        max_categories=settings.WB_MAX_CATEGORIES,
+    )
     try:
-        for query in settings.wb_queries_list:
-            products = await parser.search_products(query, max_pages=2)
-            all_products.extend(products)
-            logger.info("WB '%s': found %d products", query, len(products))
+        return await parser.scan_all_categories(
+            pages_per_category=settings.WB_PAGES_PER_CATEGORY,
+        )
     finally:
         await parser.close()
-
-    return all_products
 
 
 async def scan_ozon() -> list[Product]:
-    """Scan Ozon for products."""
-    parser = OzonParser()
-    all_products: list[Product] = []
-
+    """Scan ALL Ozon categories sorted by discount."""
+    parser = OzonParser(max_categories=settings.OZON_MAX_CATEGORIES)
     try:
-        for query in settings.ozon_queries_list:
-            products = await parser.search_products(query, max_pages=1)
-            all_products.extend(products)
-            logger.info("Ozon '%s': found %d products", query, len(products))
+        return await parser.scan_all_categories(
+            pages_per_category=settings.OZON_PAGES_PER_CATEGORY,
+        )
     finally:
         await parser.close()
-
-    return all_products
 
 
 async def scan_cycle():
@@ -83,11 +76,13 @@ async def scan_cycle():
     all_products: list[Product] = []
     if isinstance(wb_products, list):
         all_products.extend(wb_products)
+        logger.info("WB: %d products with big discounts", len(wb_products))
     else:
         logger.error("WB scan error: %s", wb_products)
 
     if isinstance(ozon_products, list):
         all_products.extend(ozon_products)
+        logger.info("Ozon: %d products with big discounts", len(ozon_products))
     else:
         logger.error("Ozon scan error: %s", ozon_products)
 
@@ -160,11 +155,7 @@ async def scan_cycle():
 
 async def run_once():
     """Single scan cycle for GitHub Actions / cron usage."""
-    logger.info("Starting single scan cycle")
-    logger.info("Anomaly threshold: %.0f%%", settings.ANOMALY_THRESHOLD_PERCENT)
-    logger.info("WB queries: %s", settings.wb_queries_list)
-    logger.info("Ozon queries: %s", settings.ozon_queries_list)
-
+    logger.info("Starting single scan cycle (all categories)")
     await db.init()
     try:
         await scan_cycle()
@@ -176,11 +167,11 @@ async def run_once():
 
 async def run_loop():
     """Continuous mode with scheduler for local / Codespaces usage."""
-    logger.info("Starting Marketplace Price Anomaly Bot")
+    logger.info("Starting Marketplace Price Anomaly Bot (all categories)")
+    logger.info("WB categories: %d, Ozon categories: %d",
+                settings.WB_MAX_CATEGORIES, settings.OZON_MAX_CATEGORIES)
     logger.info("Scan interval: %d minutes", settings.SCAN_INTERVAL_MINUTES)
     logger.info("Anomaly threshold: %.0f%%", settings.ANOMALY_THRESHOLD_PERCENT)
-    logger.info("WB queries: %s", settings.wb_queries_list)
-    logger.info("Ozon queries: %s", settings.ozon_queries_list)
 
     await db.init()
 
@@ -188,11 +179,11 @@ async def run_loop():
         await notifier.bot.send_message(
             chat_id=settings.TELEGRAM_CHAT_ID,
             text=(
-                "<b>Bot started</b>\n"
+                "<b>Bot started — scanning ALL categories</b>\n"
+                f"WB: {settings.WB_MAX_CATEGORIES} categories\n"
+                f"Ozon: {settings.OZON_MAX_CATEGORIES} categories\n"
                 f"Scan interval: {settings.SCAN_INTERVAL_MINUTES} min\n"
-                f"Threshold: {settings.ANOMALY_THRESHOLD_PERCENT:.0f}%\n"
-                f"WB queries: {', '.join(settings.wb_queries_list)}\n"
-                f"Ozon queries: {', '.join(settings.ozon_queries_list)}"
+                f"Threshold: {settings.ANOMALY_THRESHOLD_PERCENT:.0f}%"
             ),
             parse_mode="HTML",
         )

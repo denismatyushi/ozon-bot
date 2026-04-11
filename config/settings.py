@@ -10,10 +10,12 @@ class Settings(BaseSettings):
 
     # Wildberries
     WB_DEST: str = "-1257786"
-    WB_SEARCH_QUERIES: str = "iphone,samsung,dyson,airpods,playstation"
+    WB_MAX_CATEGORIES: int = 50
+    WB_PAGES_PER_CATEGORY: int = 2
 
     # Ozon
-    OZON_SEARCH_QUERIES: str = "iphone,samsung,dyson,airpods,playstation"
+    OZON_MAX_CATEGORIES: int = 25
+    OZON_PAGES_PER_CATEGORY: int = 1
 
     # Anomaly detection
     ANOMALY_THRESHOLD_PERCENT: float = 60.0
@@ -31,14 +33,6 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = "INFO"
-
-    @property
-    def wb_queries_list(self) -> list[str]:
-        return [q.strip() for q in self.WB_SEARCH_QUERIES.split(",") if q.strip()]
-
-    @property
-    def ozon_queries_list(self) -> list[str]:
-        return [q.strip() for q in self.OZON_SEARCH_QUERIES.split(",") if q.strip()]
 
 
 settings = Settings()
