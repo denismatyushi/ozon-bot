@@ -5,33 +5,12 @@ import random
 import re
 from datetime import datetime
 
-import aiohttp
+from curl_cffi.requests import AsyncSession
 
 from src.models.product import Product
 from src.parsers.base import BaseParser
 
 logger = logging.getLogger(__name__)
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/134.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-              "image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Connection": "keep-alive",
-    "sec-ch-ua": '"Chromium";v="134", "Google Chrome";v="134", "Not:A-Brand";v="24"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "none",
-    "sec-fetch-user": "?1",
-    "upgrade-insecure-requests": "1",
-}
 
 MAX_RETRIES = 3
 
@@ -66,32 +45,16 @@ OZON_CATEGORIES = [
 
 
 class OzonParser(BaseParser):
-    """Ozon parser — browses category pages by discount AND by cheapest price."""
+    """Ozon parser — uses curl_cffi to bypass TLS fingerprint detection."""
 
     def __init__(self, max_categories: int = 25):
         self.max_categories = max_categories
-        self._session: aiohttp.ClientSession | None = None
+        self._session: AsyncSession | None = None
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            jar = aiohttp.CookieJar()
-            self._session = aiohttp.ClientSession(headers=HEADERS, cookie_jar=jar)
-            await self._warmup_session()
+    async def _get_session(self) -> AsyncSession:
+        if self._session is None:
+            self._session = AsyncSession(impersonate="chrome124")
         return self._session
-
-    async def _warmup_session(self) -> None:
-        """Visit the main page to obtain session cookies."""
-        try:
-            async with self._session.get(
-                "https://www.ozon.ru/",
-                timeout=aiohttp.ClientTimeout(total=15),
-                allow_redirects=True,
-            ) as resp:
-                await resp.read()
-                logger.info("Ozon session warmup: status %d, cookies: %d",
-                            resp.status, len(self._session.cookie_jar))
-        except Exception as e:
-            logger.warning("Ozon warmup failed: %s", e)
 
     async def scan_all_categories(self, pages_per_category: int = 1) -> list[Product]:
         """Browse Ozon categories by discount and by cheapest price."""
@@ -138,33 +101,35 @@ class OzonParser(BaseParser):
             logger.info("Ozon '%s' (sort=%s): %d products", cat_name, sorting, len(products))
         return products
 
-    async def _fetch_page(self, session: aiohttp.ClientSession, url: str) -> str | None:
+    async def _fetch_page(self, session: AsyncSession, url: str) -> str | None:
         for attempt in range(MAX_RETRIES):
             try:
-                extra_headers = {"Referer": "https://www.ozon.ru/"}
-                async with session.get(
+                resp = await session.get(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=25),
+                    timeout=25,
                     allow_redirects=True,
-                    headers=extra_headers,
-                ) as resp:
-                    if resp.status == 403:
-                        wait = (2 ** attempt) + random.uniform(1, 3)
-                        logger.warning(
-                            "Ozon 403 (attempt %d/%d), retrying in %.1fs",
-                            attempt + 1, MAX_RETRIES, wait,
-                        )
-                        await asyncio.sleep(wait)
-                        continue
-                    if resp.status == 429:
-                        wait = 10 + random.uniform(2, 5)
-                        logger.warning("Ozon rate limited, waiting %.1fs...", wait)
-                        await asyncio.sleep(wait)
-                        continue
-                    if resp.status != 200:
-                        logger.error("Ozon error: status %d for %s", resp.status, url)
-                        return None
-                    return await resp.text()
+                    headers={
+                        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                        "Referer": "https://www.ozon.ru/",
+                    },
+                )
+                if resp.status_code == 403:
+                    wait = (2 ** attempt) + random.uniform(1, 3)
+                    logger.warning(
+                        "Ozon 403 (attempt %d/%d), retrying in %.1fs",
+                        attempt + 1, MAX_RETRIES, wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code == 429:
+                    wait = 10 + random.uniform(2, 5)
+                    logger.warning("Ozon rate limited, waiting %.1fs...", wait)
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    logger.error("Ozon error: status %d for %s", resp.status_code, url)
+                    return None
+                return resp.text
             except Exception as e:
                 logger.error("Ozon request failed: %s", e)
                 if attempt < MAX_RETRIES - 1:
@@ -251,9 +216,6 @@ class OzonParser(BaseParser):
             if original_price <= 0:
                 original_price = sale_price
 
-            # No discount filter here — we collect ALL products
-            # The anomaly detector decides what's anomalous
-
             return Product(
                 source="ozon",
                 product_id=product_id,
@@ -335,5 +297,6 @@ class OzonParser(BaseParser):
         return int(cleaned) * 100
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
+        if self._session:
             await self._session.close()
+            self._session = None
