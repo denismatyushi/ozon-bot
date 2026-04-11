@@ -22,8 +22,8 @@ LAYER_LABELS = {
 
 class TelegramNotifier:
     def __init__(self, bot_token: str, chat_id: str):
-        self.bot = Bot(token=bot_token)
-        self.chat_id = chat_id
+        self.bot = Bot(token=bot_token.strip())
+        self.chat_id = chat_id.strip()
 
     async def send_anomaly(
         self,
