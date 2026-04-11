@@ -10,7 +10,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +20,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install aiohttp aiogram pydantic pydantic-settings aiosqlite "apscheduler>=3.10,<4.0" python-dotenv curl_cffi
+        run: |
+          pip install aiohttp aiogram pydantic pydantic-settings aiosqlite "apscheduler>=3.10,<4.0" python-dotenv playwright
+          playwright install --with-deps chromium
 
       - name: Restore price history DB
         uses: actions/cache@v4
