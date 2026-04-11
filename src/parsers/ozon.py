@@ -22,7 +22,7 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
-# Popular Ozon categories — IDs from ozon.ru/category/<slug>-<id>/
+# Popular Ozon categories
 OZON_CATEGORIES = [
     {"id": "15500", "name": "Elektronika", "slug": "elektronika"},
     {"id": "15548", "name": "Smartfony", "slug": "smartfony"},
@@ -53,7 +53,7 @@ OZON_CATEGORIES = [
 
 
 class OzonParser(BaseParser):
-    """Ozon parser — browses category pages sorted by discount."""
+    """Ozon parser — browses category pages by discount AND by cheapest price."""
 
     def __init__(self, max_categories: int = 25):
         self.max_categories = max_categories
@@ -64,49 +64,36 @@ class OzonParser(BaseParser):
             self._session = aiohttp.ClientSession(headers=HEADERS)
         return self._session
 
-    # ── Public API ──────────────────────────────────────────────
-
     async def scan_all_categories(self, pages_per_category: int = 1) -> list[Product]:
-        """Browse Ozon categories sorted by discount."""
-        all_products: list[Product] = []
+        """Browse Ozon categories by discount and by cheapest price."""
+        all_products: dict[str, Product] = {}  # dedup by product_id
 
         for cat in OZON_CATEGORIES[: self.max_categories]:
-            products = await self._fetch_category(cat, pages_per_category)
-            all_products.extend(products)
-            await asyncio.sleep(3)  # Ozon needs longer delays
+            # Pass 1: sorted by discount
+            products = await self._fetch_category(cat, pages_per_category, sorting="discount")
+            for p in products:
+                all_products[p.product_id] = p
 
-        return all_products
+            # Pass 2: sorted by cheapest — catches pricing errors
+            products = await self._fetch_category(cat, 1, sorting="price")
+            for p in products:
+                if p.product_id not in all_products:
+                    all_products[p.product_id] = p
+
+            await asyncio.sleep(2)
+
+        return list(all_products.values())
 
     async def search_products(self, query: str, max_pages: int = 2) -> list[Product]:
-        """Keyword search — kept as fallback."""
-        products: list[Product] = []
-        session = await self._get_session()
+        return []
 
-        for page in range(1, max_pages + 1):
-            url = f"https://www.ozon.ru/search/?text={query}&sorting=discount&page={page}"
-            html = await self._fetch_page(session, url)
-            if not html:
-                break
-
-            page_products = self._extract_products_from_html(html, query)
-            products.extend(page_products)
-            logger.info("Ozon search '%s' page %d: %d products", query, page, len(page_products))
-
-            if not page_products:
-                break
-            await asyncio.sleep(3)
-
-        return products
-
-    # ── Category browsing ───────────────────────────────────────
-
-    async def _fetch_category(self, cat: dict, max_pages: int) -> list[Product]:
+    async def _fetch_category(self, cat: dict, max_pages: int, sorting: str = "discount") -> list[Product]:
         session = await self._get_session()
         products: list[Product] = []
         cat_name = cat["name"]
 
         for page in range(1, max_pages + 1):
-            url = f"https://www.ozon.ru/category/{cat['slug']}-{cat['id']}/?sorting=discount&page={page}"
+            url = f"https://www.ozon.ru/category/{cat['slug']}-{cat['id']}/?sorting={sorting}&page={page}"
             html = await self._fetch_page(session, url)
             if not html:
                 break
@@ -119,7 +106,7 @@ class OzonParser(BaseParser):
             await asyncio.sleep(3)
 
         if products:
-            logger.info("Ozon category '%s': %d products", cat_name, len(products))
+            logger.info("Ozon '%s' (sort=%s): %d products", cat_name, sorting, len(products))
         return products
 
     async def _fetch_page(self, session: aiohttp.ClientSession, url: str) -> str | None:
@@ -140,7 +127,7 @@ class OzonParser(BaseParser):
             logger.error("Ozon request failed: %s", e)
             return None
 
-    # ── HTML extraction (same strategies as before) ─────────────
+    # ── HTML extraction ─────────────────────────────────────────
 
     def _extract_products_from_html(self, html: str, category: str) -> list[Product]:
         products: list[Product] = []
@@ -181,8 +168,7 @@ class OzonParser(BaseParser):
             except json.JSONDecodeError:
                 pass
 
-        # Strategy 3: regex fallback
-        return self._extract_with_regex(html, category)
+        return []
 
     def _parse_state_item(self, item: dict, category: str) -> Product | None:
         try:
@@ -217,11 +203,8 @@ class OzonParser(BaseParser):
             if original_price <= 0:
                 original_price = sale_price
 
-            # Skip trivial discounts
-            if original_price > 0:
-                discount = (1 - sale_price / original_price) * 100
-                if discount < 30:
-                    return None
+            # No discount filter here — we collect ALL products
+            # The anomaly detector decides what's anomalous
 
             return Product(
                 source="ozon",
@@ -293,34 +276,6 @@ class OzonParser(BaseParser):
             )
         except Exception:
             return None
-
-    def _extract_with_regex(self, html: str, category: str) -> list[Product]:
-        products = []
-        product_links = re.findall(r'href="(/product/[^"]*?-(\d+)/[^"]*?)"', html)
-        seen_ids: set[str] = set()
-
-        for link, pid in product_links[:50]:
-            if pid in seen_ids:
-                continue
-            seen_ids.add(pid)
-
-            name_match = re.search(rf'href="{re.escape(link)}"[^>]*>([^<]+)<', html)
-            name = name_match.group(1).strip() if name_match else f"Ozon product {pid}"
-
-            products.append(
-                Product(
-                    source="ozon",
-                    product_id=pid,
-                    name=name,
-                    original_price=0,
-                    sale_price=0,
-                    url=f"https://www.ozon.ru{link}",
-                    category=category,
-                    fetched_at=datetime.now(),
-                )
-            )
-
-        return [p for p in products if p.sale_price > 100]
 
     @staticmethod
     def _parse_price_string(price_str: str) -> int:

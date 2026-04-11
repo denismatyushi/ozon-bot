@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 MENU_URL = "https://static-basket-01.wbbasket.ru/vol0/data/main-menu-ru-ru-v3.json"
 CATALOG_URL = "https://catalog.wb.ru/catalog/{shard}/catalog"
-SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v7/search"
 
 HEADERS = {
     "User-Agent": (
@@ -37,59 +36,39 @@ class WildberriesParser(BaseParser):
             self._session = aiohttp.ClientSession(headers=HEADERS)
         return self._session
 
-    # ── Public API ──────────────────────────────────────────────
-
     async def scan_all_categories(self, pages_per_category: int = 2) -> list[Product]:
-        """Fetch the WB category tree, then browse each category sorted by discount."""
+        """Fetch WB category tree, browse each category by discount AND by cheapest price."""
         categories = await self._fetch_categories()
         if not categories:
-            logger.warning("No WB categories fetched, falling back to search")
+            logger.warning("No WB categories fetched")
             return []
 
         logger.info("WB: loaded %d categories, scanning up to %d", len(categories), self.max_categories)
-        all_products: list[Product] = []
+        all_products: dict[str, Product] = {}  # dedup by product_id
 
         for cat in categories[: self.max_categories]:
-            products = await self._fetch_category_products(cat, pages_per_category)
-            all_products.extend(products)
-            # Polite delay between categories
-            await asyncio.sleep(1.0)
+            # Pass 1: sorted by discount — catches big sales
+            products = await self._fetch_category_products(cat, pages_per_category, sort="sale")
+            for p in products:
+                all_products[p.product_id] = p
 
-        return all_products
+            # Pass 2: sorted by cheapest price — catches pricing errors
+            products = await self._fetch_category_products(cat, 1, sort="priceup")
+            for p in products:
+                if p.product_id not in all_products:
+                    all_products[p.product_id] = p
+
+            await asyncio.sleep(0.5)
+
+        return list(all_products.values())
 
     async def search_products(self, query: str, max_pages: int = 3) -> list[Product]:
         """Keyword search — kept as fallback."""
-        products: list[Product] = []
-        session = await self._get_session()
-
-        for page in range(1, max_pages + 1):
-            params = {
-                "appType": "1",
-                "curr": "rub",
-                "dest": self.dest,
-                "page": str(page),
-                "query": query,
-                "resultset": "catalog",
-                "sort": "sale",
-                "spp": "30",
-                "suppressSpellcheck": "false",
-            }
-            items = await self._request_products(session, SEARCH_URL, params)
-            if not items:
-                break
-            for item in items:
-                p = self._parse_product(item, query)
-                if p:
-                    products.append(p)
-            logger.info("WB search '%s' page %d: %d items", query, page, len(items))
-            await asyncio.sleep(1.5)
-
-        return products
+        return []
 
     # ── Category tree ───────────────────────────────────────────
 
     async def _fetch_categories(self) -> list[dict]:
-        """Download WB main menu and extract browsable categories with shard+query."""
         session = await self._get_session()
         try:
             async with session.get(MENU_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -106,30 +85,43 @@ class WildberriesParser(BaseParser):
         return categories
 
     def _extract_categories(self, nodes: list | dict, out: list[dict]):
-        """Recursively walk the menu tree and collect leaf categories that have shard+query."""
         if isinstance(nodes, dict):
             nodes = [nodes]
         for node in nodes:
             shard = node.get("shard")
             query = node.get("query")
             name = node.get("name", "")
-            # Leaf category with catalog params
             if shard and query:
                 out.append({"shard": shard, "query": query, "name": name})
-            # Recurse into children
             children = node.get("childs") or node.get("nodes") or []
             if children:
                 self._extract_categories(children, out)
 
     # ── Catalog fetching ────────────────────────────────────────
 
-    async def _fetch_category_products(self, cat: dict, max_pages: int) -> list[Product]:
+    def _parse_query_params(self, query_str: str) -> dict[str, str]:
+        """Parse WB query string like 'cat=8126;kind=3' into dict."""
+        params: dict[str, str] = {}
+        for part in query_str.split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, value = part.split("=", 1)
+                params[key.strip()] = value.strip()
+            elif part:
+                params["cat"] = part
+        return params
+
+    async def _fetch_category_products(
+        self, cat: dict, max_pages: int, sort: str = "sale"
+    ) -> list[Product]:
         session = await self._get_session()
         products: list[Product] = []
         shard = cat["shard"]
         cat_name = cat["name"]
-
         url = CATALOG_URL.format(shard=shard)
+
+        # Parse the query params correctly (handles "cat=8126;kind=3" etc.)
+        query_params = self._parse_query_params(cat["query"])
 
         for page in range(1, max_pages + 1):
             params = {
@@ -137,11 +129,9 @@ class WildberriesParser(BaseParser):
                 "curr": "rub",
                 "dest": self.dest,
                 "page": str(page),
-                "sort": "sale",       # sort by discount
+                "sort": sort,
                 "spp": "30",
-                cat["query"].split("=")[0] if "=" in cat["query"] else "cat": (
-                    cat["query"].split("=")[1] if "=" in cat["query"] else cat["query"]
-                ),
+                **query_params,
             }
             items = await self._request_products(session, url, params)
             if not items:
@@ -153,10 +143,8 @@ class WildberriesParser(BaseParser):
             await asyncio.sleep(1.0)
 
         if products:
-            logger.info("WB category '%s': %d products", cat_name, len(products))
+            logger.info("WB '%s' (sort=%s): %d products", cat_name, sort, len(products))
         return products
-
-    # ── Shared helpers ──────────────────────────────────────────
 
     async def _request_products(self, session: aiohttp.ClientSession, url: str, params: dict) -> list[dict]:
         try:
@@ -183,16 +171,11 @@ class WildberriesParser(BaseParser):
         sale_price = item.get("salePriceU", 0)
         original_price = item.get("priceU", 0)
 
-        if sale_price <= 100:  # > 1 rub
+        # Skip garbage: price <= 1 RUB or no name
+        if sale_price <= 100 or not name:
             return None
         if original_price <= 0:
             original_price = sale_price
-
-        # Skip if discount is trivial (< 30%) to save memory
-        if original_price > 0:
-            discount = (1 - sale_price / original_price) * 100
-            if discount < 30:
-                return None
 
         return Product(
             source="wildberries",

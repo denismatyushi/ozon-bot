@@ -54,4 +54,6 @@ class AnomalyResult(BaseModel):
     discount_percent: float
     z_score: float | None = None
     iqr_lower_bound: float | None = None
+    cross_marketplace_price: float | None = None  # price on other marketplace (kopecks)
+    cross_marketplace_source: str | None = None  # "wildberries" | "ozon"
     confidence: str  # "HIGH" | "MEDIUM" | "LOW"

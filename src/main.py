@@ -7,7 +7,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config.settings import settings
 from src.anomaly.detector import AnomalyDetector
-from src.crossref.checker import CrossRefChecker
 from src.models.product import Product
 from src.notifier.telegram import TelegramNotifier
 from src.parsers.ozon import OzonParser
@@ -29,11 +28,10 @@ detector = AnomalyDetector(
     z_score_threshold=settings.ANOMALY_Z_SCORE_THRESHOLD,
 )
 notifier = TelegramNotifier(settings.TELEGRAM_BOT_TOKEN, settings.TELEGRAM_CHAT_ID)
-crossref = CrossRefChecker(serpapi_key=settings.SERPAPI_KEY)
 
 
 async def scan_wildberries() -> list[Product]:
-    """Scan ALL Wildberries categories sorted by discount."""
+    """Scan ALL Wildberries categories by discount and by cheapest price."""
     parser = WildberriesParser(
         dest=settings.WB_DEST,
         max_categories=settings.WB_MAX_CATEGORIES,
@@ -47,7 +45,7 @@ async def scan_wildberries() -> list[Product]:
 
 
 async def scan_ozon() -> list[Product]:
-    """Scan ALL Ozon categories sorted by discount."""
+    """Scan ALL Ozon categories by discount and by cheapest price."""
     parser = OzonParser(max_categories=settings.OZON_MAX_CATEGORIES)
     try:
         return await parser.scan_all_categories(
@@ -58,7 +56,7 @@ async def scan_ozon() -> list[Product]:
 
 
 async def scan_cycle():
-    """Main scan cycle: fetch, detect, verify, notify."""
+    """Main scan cycle: fetch, detect, cross-compare, notify."""
     started_at = datetime.now()
     logger.info("=== Scan cycle started ===")
 
@@ -76,13 +74,13 @@ async def scan_cycle():
     all_products: list[Product] = []
     if isinstance(wb_products, list):
         all_products.extend(wb_products)
-        logger.info("WB: %d products with big discounts", len(wb_products))
+        logger.info("WB: %d products collected", len(wb_products))
     else:
         logger.error("WB scan error: %s", wb_products)
 
     if isinstance(ozon_products, list):
         all_products.extend(ozon_products)
-        logger.info("Ozon: %d products with big discounts", len(ozon_products))
+        logger.info("Ozon: %d products collected", len(ozon_products))
     else:
         logger.error("Ozon scan error: %s", ozon_products)
 
@@ -90,7 +88,7 @@ async def scan_cycle():
         logger.info("No products found, skipping cycle")
         return
 
-    logger.info("Total products fetched: %d", len(all_products))
+    logger.info("Total products: %d", len(all_products))
 
     # 2. Save prices to history
     price_dicts = [
@@ -109,33 +107,23 @@ async def scan_cycle():
     # 3. Load price history for z-score analysis
     price_history = await db.get_price_history()
 
-    # 4. Detect anomalies
+    # 4. Detect anomalies (includes cross-marketplace comparison)
     anomalies = detector.detect(all_products, price_history)
     logger.info("Anomalies detected: %d", len(anomalies))
 
-    # 5. Filter duplicates and verify
+    # 5. Filter already-notified and send alerts
     notifications_sent = 0
     for anomaly in anomalies:
         p = anomaly.product
 
-        # Skip if already notified
         if await db.was_notified(p.source, p.product_id, p.sale_price):
             continue
 
-        # Cross-reference if enabled
-        crossref_result = None
-        if settings.CROSSREF_ENABLED:
-            crossref_result = await crossref.verify(anomaly)
-            if not crossref_result.is_confirmed_anomaly:
-                logger.info("Cross-ref rejected anomaly: %s", p.name)
-                continue
-
-        # Send notification
-        await notifier.send_anomaly(anomaly, crossref_result)
+        await notifier.send_anomaly(anomaly)
         await db.mark_notified(p.source, p.product_id, p.sale_price)
         notifications_sent += 1
 
-    # 6. Save scan run stats
+    # 6. Save scan stats
     finished_at = datetime.now()
     await db.save_scan_run(
         started_at=started_at,
@@ -154,19 +142,18 @@ async def scan_cycle():
 
 
 async def run_once():
-    """Single scan cycle for GitHub Actions / cron usage."""
+    """Single scan cycle for GitHub Actions / cron."""
     logger.info("Starting single scan cycle (all categories)")
     await db.init()
     try:
         await scan_cycle()
     finally:
-        await crossref.close()
         await notifier.close()
         await db.close()
 
 
 async def run_loop():
-    """Continuous mode with scheduler for local / Codespaces usage."""
+    """Continuous mode with scheduler."""
     logger.info("Starting Marketplace Price Anomaly Bot (all categories)")
     logger.info("WB categories: %d, Ozon categories: %d",
                 settings.WB_MAX_CATEGORIES, settings.OZON_MAX_CATEGORIES)
@@ -183,7 +170,8 @@ async def run_loop():
                 f"WB: {settings.WB_MAX_CATEGORIES} categories\n"
                 f"Ozon: {settings.OZON_MAX_CATEGORIES} categories\n"
                 f"Scan interval: {settings.SCAN_INTERVAL_MINUTES} min\n"
-                f"Threshold: {settings.ANOMALY_THRESHOLD_PERCENT:.0f}%"
+                f"Threshold: {settings.ANOMALY_THRESHOLD_PERCENT:.0f}%\n"
+                f"Cross-marketplace comparison: ON"
             ),
             parse_mode="HTML",
         )
@@ -205,7 +193,6 @@ async def run_loop():
         logger.info("Shutting down...")
     finally:
         scheduler.shutdown()
-        await crossref.close()
         await notifier.close()
         await db.close()
 
