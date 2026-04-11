@@ -1,15 +1,12 @@
 name: Price Anomaly Scanner
 
 on:
-  # Run every 15 minutes automatically
   schedule:
     - cron: "*/15 * * * *"
 
-  # Also run on any push (so it starts immediately after deploy)
   push:
-    branches: ["*"]
+    branches: ["main"]
 
-  # Manual trigger button in GitHub Actions UI
   workflow_dispatch:
 
 jobs:
@@ -33,22 +30,17 @@ jobs:
       - name: Install dependencies
         run: pip install aiohttp aiogram pydantic pydantic-settings aiosqlite "apscheduler>=3.10,<4.0" python-dotenv
 
-      # Restore the SQLite database from previous runs
-      # so z-score anomaly detection has history
       - name: Restore price history DB
         uses: actions/cache@v4
         with:
           path: data/prices.db
-          key: price-db-${{ github.ref_name }}
+          key: price-db-${{ github.run_id }}
           restore-keys: price-db-
 
       - name: Run full category scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          WB_MAX_CATEGORIES: "50"
-          OZON_MAX_CATEGORIES: "25"
           ANOMALY_THRESHOLD_PERCENT: "60"
-          CROSSREF_ENABLED: "false"
           LOG_LEVEL: "INFO"
         run: python -m src.main --once
