@@ -17,6 +17,7 @@ import json
 import logging
 import random
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from src.models.product import Product
 from src.parsers.base import BaseParser
@@ -37,6 +38,26 @@ API_RESPONSE_MARKERS = (
     "/api/composer-api.bx/",
     "searchResultsV2",
 )
+
+
+def _build_playwright_proxy(proxy_url: str) -> dict[str, str]:
+    """Parse proxy URL and return Playwright-compatible dict.
+
+    Chromium does NOT accept user:pass@host in the server URL — credentials
+    must be passed as separate 'username'/'password' keys, otherwise the
+    browser raises ERR_PROXY_CONNECTION_FAILED.
+    """
+    parsed = urlparse(proxy_url)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or ""
+    port = parsed.port
+    server = f"{scheme}://{host}" + (f":{port}" if port else "")
+    result: dict[str, str] = {"server": server}
+    if parsed.username:
+        result["username"] = unquote(parsed.username)
+    if parsed.password:
+        result["password"] = unquote(parsed.password)
+    return result
 
 
 class OzonParser(BaseParser):
@@ -89,7 +110,7 @@ class OzonParser(BaseParser):
             "chromium_sandbox": False,
         }
         if proxy_record is not None:
-            launch_kwargs["proxy"] = {"server": proxy_record.url}
+            launch_kwargs["proxy"] = _build_playwright_proxy(proxy_record.url)
         self._browser = await self._playwright.chromium.launch(**launch_kwargs)
 
     async def _new_context(self):
@@ -183,9 +204,13 @@ class OzonParser(BaseParser):
             logger.info("Ozon '%s': %d products", cat_name, len(deduped))
             return deduped
         except Exception as e:
-            logger.warning("Ozon '%s' failed: %s", cat_name, e)
+            msg = str(e)
+            logger.warning("Ozon '%s' failed: %s", cat_name, msg)
             if proxy_record is not None:
                 proxy_record.mark_failure()
+            # Re-raise only connection-level proxy failures so caller can fallback to direct
+            if "ERR_PROXY_CONNECTION_FAILED" in msg or "ERR_TUNNEL_CONNECTION_FAILED" in msg:
+                raise RuntimeError("proxy_unreachable") from e
             return []
         finally:
             try:
@@ -201,11 +226,24 @@ class OzonParser(BaseParser):
                 pass
 
     async def _scan_category_with_retries(self, category: dict, max_attempts: int = 3) -> list[Product]:
+        proxy_unreachable_streak = 0
         for attempt in range(1, max_attempts + 1):
-            proxy = self.pool.acquire() if self.pool else None
-            products = await self._scan_category_once(category, proxy)
-            if products:
-                return products
+            # After 2 consecutive proxy connection failures, try without proxy
+            use_proxy = proxy_unreachable_streak < 2
+            proxy = self.pool.acquire() if (self.pool and use_proxy) else None
+            if not use_proxy:
+                logger.warning("Ozon '%s' attempt %d: direct connection (proxy unreachable)",
+                               category["name"], attempt)
+            try:
+                products = await self._scan_category_once(category, proxy)
+                proxy_unreachable_streak = 0
+                if products:
+                    return products
+            except RuntimeError as e:
+                if str(e) == "proxy_unreachable":
+                    proxy_unreachable_streak += 1
+                else:
+                    raise
             # Backoff between attempts with jitter
             await asyncio.sleep(random.uniform(3, 8) * attempt)
         return []
