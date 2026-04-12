@@ -202,20 +202,57 @@ class OzonParser(BaseParser):
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             status = resp.status if resp else 0
             blocked = status in (403, 429)
+
             if blocked:
-                # Log body snippet so we can see if this is a WAF challenge page or hard reject
+                body = ""
                 try:
                     body = await resp.text()
-                    snippet = (body or "")[:400].replace("\n", " ")
-                    logger.warning("Ozon %d body snippet: %s", status, snippet)
-                except Exception as e:
-                    logger.warning("Ozon %d (body read failed: %s)", status, e)
-                # Give challenge JS a chance to run + API payloads to arrive
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=8_000)
                 except Exception:
                     pass
-                await random_dwell(2.0, 4.0)
+                is_challenge = (
+                    "Antibot" in body
+                    or "abt-complaints" in body
+                    or "challenge" in body.lower()[:2000]
+                )
+                snippet = (body or "")[:300].replace("\n", " ")
+                logger.warning("Ozon %d (challenge=%s): %s", status, is_challenge, snippet)
+
+                if is_challenge:
+                    # Solve Ozon Antibot challenge: let JS compute token + set cookie,
+                    # generate some user activity, then retry navigation.
+                    logger.info("Ozon: solving Antibot challenge for '%s'", cat_name)
+                    # 1) Let challenge JS finish
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=15_000)
+                    except Exception:
+                        pass
+                    await random_dwell(2.0, 4.0)
+                    # 2) Human activity — challenge JS often watches for real mouse events
+                    await human_viewport_tour(page, n_moves=random.randint(3, 5))
+                    await random_dwell(1.0, 2.5)
+                    # 3) Check if challenge auto-redirected us out
+                    current = page.url
+                    if "ozon.ru" in current and "abt" not in current:
+                        logger.info("Ozon: challenge auto-redirected to %s", current)
+                    else:
+                        # 4) Retry original URL — cookie set by challenge should now ride
+                        logger.info("Ozon: retrying original URL after challenge")
+                        try:
+                            resp2 = await page.goto(url, wait_until="domcontentloaded",
+                                                    timeout=60_000, referer="https://yandex.ru/")
+                            status = resp2.status if resp2 else 0
+                            logger.info("Ozon: retry status=%d", status)
+                            if status not in (403, 429):
+                                blocked = False
+                        except Exception as e:
+                            logger.warning("Ozon retry after challenge failed: %s", e)
+                else:
+                    # Hard block — give a grace period anyway in case of partial challenge
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8_000)
+                    except Exception:
+                        pass
+                    await random_dwell(2.0, 4.0)
 
             # Human-like interaction to trigger lazy-load + viewport checks
             await random_dwell(1.0, 2.0)
