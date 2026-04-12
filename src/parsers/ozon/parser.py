@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import random
+import socket
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -38,6 +39,46 @@ API_RESPONSE_MARKERS = (
     "/api/composer-api.bx/",
     "searchResultsV2",
 )
+
+
+def _redact_proxy(url: str) -> str:
+    try:
+        p = urlparse(url)
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port else ""
+        cred = "***@" if p.username or p.password else ""
+        return f"{p.scheme}://{cred}{host}{port}"
+    except Exception:
+        return "<unparseable>"
+
+
+async def _proxy_tcp_reachable(url: str, timeout: float = 5.0) -> tuple[bool, str]:
+    """Check if we can open a TCP socket to the proxy host:port."""
+    try:
+        p = urlparse(url)
+        host = p.hostname
+        port = p.port
+        if not host or not port:
+            return False, "missing host/port"
+        loop = asyncio.get_event_loop()
+
+        def _connect():
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            try:
+                s.connect((host, port))
+                return True, "ok"
+            except Exception as e:
+                return False, f"{type(e).__name__}: {e}"
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+        return await loop.run_in_executor(None, _connect)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _build_playwright_proxy(proxy_url: str) -> dict[str, str]:
@@ -248,8 +289,39 @@ class OzonParser(BaseParser):
             await asyncio.sleep(random.uniform(3, 8) * attempt)
         return []
 
+    async def _preflight_proxy_check(self) -> None:
+        """Test each proxy at TCP level; disable unreachable ones before scan."""
+        if not self.pool:
+            logger.info("Ozon: no proxy configured — direct connection")
+            return
+        healthy: list[ProxyRecord] = []
+        for rec in self.pool.proxies:
+            parsed = _build_playwright_proxy(rec.url)
+            logger.info("Ozon: testing proxy %s (scheme=%s, auth=%s)",
+                        _redact_proxy(rec.url),
+                        urlparse(rec.url).scheme,
+                        bool(parsed.get("username")))
+            ok, info = await _proxy_tcp_reachable(rec.url)
+            if ok:
+                logger.info("  -> reachable")
+                healthy.append(rec)
+            else:
+                logger.warning("  -> UNREACHABLE: %s", info)
+        if not healthy:
+            logger.error(
+                "Ozon: no healthy proxies — running DIRECT. "
+                "Check OZON_PROXY_URL: credentials, scheme (http/socks5), "
+                "port, and whether proxy whitelists runner IP."
+            )
+            self.pool = ProxyPool(proxies=[])
+        else:
+            self.pool = ProxyPool(proxies=healthy)
+            logger.info("Ozon: %d/%d proxies healthy", len(healthy),
+                        len(healthy) + (len(self.pool.proxies) - len(healthy)))
+
     async def scan_all_categories(self, pages_per_category: int = 1) -> list[Product]:
         self.pages_per_category = pages_per_category
+        await self._preflight_proxy_check()
         cats = OZON_CATEGORIES[: self.max_categories]
         all_products: list[Product] = []
         for i, cat in enumerate(cats, 1):
