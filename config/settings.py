@@ -7,6 +7,10 @@ class Settings(BaseSettings):
     # Telegram
     TELEGRAM_BOT_TOKEN: str
     TELEGRAM_CHAT_ID: str
+    TELEGRAM_API_BASE_URL: str | None = None
+
+    # Proxy
+    PROXY_URL: str | None = None
 
     # Wildberries
     WB_DEST: str = "-1257786"

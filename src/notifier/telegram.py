@@ -2,6 +2,8 @@ import asyncio
 import logging
 
 from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 
 from src.models.product import AnomalyResult, CrossRefResult
 
@@ -21,8 +23,26 @@ LAYER_LABELS = {
 
 
 class TelegramNotifier:
-    def __init__(self, bot_token: str, chat_id: str):
-        self.bot = Bot(token=bot_token.strip())
+    def __init__(
+        self,
+        bot_token: str,
+        chat_id: str,
+        proxy_url: str | None = None,
+        api_base_url: str | None = None,
+    ):
+        session = None
+        if proxy_url or api_base_url:
+            api = (
+                TelegramAPIServer.from_base(api_base_url)
+                if api_base_url
+                else TelegramAPIServer(
+                    base="https://api.telegram.org/bot{token}/{method}",
+                    file="https://api.telegram.org/file/bot{token}/{path}",
+                )
+            )
+            session = AiohttpSession(proxy=proxy_url, api=api)
+
+        self.bot = Bot(token=bot_token.strip(), session=session)
         self.chat_id = chat_id.strip()
 
     async def send_anomaly(
