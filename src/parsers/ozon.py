@@ -6,6 +6,7 @@ from datetime import datetime
 
 import aiohttp
 
+from config.settings import settings
 from src.models.product import Product
 from src.parsers.base import BaseParser
 
@@ -64,6 +65,12 @@ class OzonParser(BaseParser):
             self._session = aiohttp.ClientSession(headers=HEADERS)
         return self._session
 
+    async def _request_get(self, session: aiohttp.ClientSession, url: str, **kwargs):
+        """Helper to inject proxy into all GET requests."""
+        if settings.PROXY_URL:
+            kwargs.setdefault("proxy", settings.PROXY_URL)
+        return await session.get(url, **kwargs)
+
     async def scan_all_categories(self, pages_per_category: int = 1) -> list[Product]:
         """Browse Ozon categories by discount and by cheapest price."""
         all_products: dict[str, Product] = {}  # dedup by product_id
@@ -111,7 +118,9 @@ class OzonParser(BaseParser):
 
     async def _fetch_page(self, session: aiohttp.ClientSession, url: str) -> str | None:
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True) as resp:
+            async with self._request_get(
+                session, url, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True
+            ) as resp:
                 if resp.status == 403:
                     logger.warning("Ozon blocked request (403)")
                     return None

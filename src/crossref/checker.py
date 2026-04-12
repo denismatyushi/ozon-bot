@@ -3,6 +3,7 @@ import re
 
 import aiohttp
 
+from config.settings import settings
 from src.models.product import AnomalyResult, CrossRefResult, ReferencePrice
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,12 @@ class CrossRefChecker:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
+
+    async def _request_get(self, session: aiohttp.ClientSession, url: str, **kwargs):
+        """Helper to inject proxy into all GET requests."""
+        if settings.PROXY_URL:
+            kwargs.setdefault("proxy", settings.PROXY_URL)
+        return await session.get(url, **kwargs)
 
     async def verify(self, anomaly: AnomalyResult) -> CrossRefResult:
         """Verify an anomaly by checking prices on other sources."""
@@ -63,7 +70,8 @@ class CrossRefChecker:
                 "hl": "ru",
                 "api_key": self.serpapi_key,
             }
-            async with session.get(
+            async with self._request_get(
+                session,
                 "https://serpapi.com/search",
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=10),

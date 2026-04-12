@@ -29,7 +29,12 @@ def _create_components():
         threshold_percent=settings.ANOMALY_THRESHOLD_PERCENT,
         z_score_threshold=settings.ANOMALY_Z_SCORE_THRESHOLD,
     )
-    notifier = TelegramNotifier(settings.TELEGRAM_BOT_TOKEN, settings.TELEGRAM_CHAT_ID)
+    notifier = TelegramNotifier(
+        settings.TELEGRAM_BOT_TOKEN,
+        settings.TELEGRAM_CHAT_ID,
+        proxy_url=settings.PROXY_URL,
+        api_base_url=settings.TELEGRAM_API_BASE_URL,
+    )
     return db, detector, notifier
 
 
@@ -146,6 +151,21 @@ async def run_once():
 
 async def run_loop():
     logger.info("Starting Marketplace Price Anomaly Bot (all categories)")
+
+    if settings.PROXY_URL:
+        from urllib.parse import urlparse
+        parsed = urlparse(settings.PROXY_URL)
+        if parsed.password:
+            masked = f"{parsed.scheme}://{parsed.username}:*****@{parsed.hostname}"
+            if parsed.port:
+                masked += f":{parsed.port}"
+            logger.info("Using proxy: %s", masked)
+        else:
+            logger.info("Using proxy: %s", settings.PROXY_URL)
+
+    if settings.TELEGRAM_API_BASE_URL:
+        logger.info("Using custom Telegram API server: %s", settings.TELEGRAM_API_BASE_URL)
+
     logger.info("WB categories: %d, Ozon categories: %d",
                 settings.WB_MAX_CATEGORIES, settings.OZON_MAX_CATEGORIES)
     logger.info("Scan interval: %d minutes", settings.SCAN_INTERVAL_MINUTES)

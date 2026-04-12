@@ -4,6 +4,7 @@ from datetime import datetime
 
 import aiohttp
 
+from config.settings import settings
 from src.models.product import Product
 from src.parsers.base import BaseParser
 
@@ -35,6 +36,12 @@ class WildberriesParser(BaseParser):
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(headers=HEADERS)
         return self._session
+
+    async def _request_get(self, session: aiohttp.ClientSession, url: str, **kwargs):
+        """Helper to inject proxy into all GET requests."""
+        if settings.PROXY_URL:
+            kwargs.setdefault("proxy", settings.PROXY_URL)
+        return await session.get(url, **kwargs)
 
     async def scan_all_categories(self, pages_per_category: int = 2) -> list[Product]:
         """Fetch WB category tree, browse each category by discount AND by cheapest price."""
@@ -71,7 +78,9 @@ class WildberriesParser(BaseParser):
     async def _fetch_categories(self) -> list[dict]:
         session = await self._get_session()
         try:
-            async with session.get(MENU_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with self._request_get(
+                session, MENU_URL, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
                 if resp.status != 200:
                     logger.error("WB menu fetch failed: %d", resp.status)
                     return []
@@ -148,7 +157,9 @@ class WildberriesParser(BaseParser):
 
     async def _request_products(self, session: aiohttp.ClientSession, url: str, params: dict) -> list[dict]:
         try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with self._request_get(
+                session, url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
                 if resp.status == 429:
                     logger.warning("WB rate limited, waiting 5s...")
                     await asyncio.sleep(5)
