@@ -230,22 +230,35 @@ class OzonParser(BaseParser):
                     # 2) Human activity — challenge JS often watches for real mouse events
                     await human_viewport_tour(page, n_moves=random.randint(3, 5))
                     await random_dwell(1.0, 2.5)
-                    # 3) Check if challenge auto-redirected us out
+
                     current = page.url
-                    if "ozon.ru" in current and "abt" not in current:
+                    auto_redirected = "ozon.ru" in current and "abt" not in current
+                    if auto_redirected:
                         logger.info("Ozon: challenge auto-redirected to %s", current)
-                    else:
-                        # 4) Retry original URL — cookie set by challenge should now ride
-                        logger.info("Ozon: retrying original URL after challenge")
-                        try:
-                            resp2 = await page.goto(url, wait_until="domcontentloaded",
-                                                    timeout=60_000, referer="https://yandex.ru/")
-                            status = resp2.status if resp2 else 0
-                            logger.info("Ozon: retry status=%d", status)
-                            if status not in (403, 429):
-                                blocked = False
-                        except Exception as e:
-                            logger.warning("Ozon retry after challenge failed: %s", e)
+
+                    # 3) Always retry the clean original URL — cookie set by challenge
+                    #    should now ride, and we avoid the ?__rr= redirect-guard state.
+                    logger.info("Ozon: re-navigating clean URL after challenge")
+                    try:
+                        resp2 = await page.goto(url, wait_until="domcontentloaded",
+                                                timeout=60_000, referer="https://yandex.ru/")
+                        status = resp2.status if resp2 else 0
+                        logger.info("Ozon: retry status=%d, final URL=%s", status, page.url)
+                        if status not in (403, 429):
+                            blocked = False
+                        else:
+                            # Still blocked — check if it's still a challenge (2nd layer)
+                            try:
+                                body2 = (await resp2.text() or "")[:200]
+                                logger.warning("Ozon still blocked after challenge: %s",
+                                               body2.replace("\n", " "))
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning("Ozon retry after challenge failed: %s", e)
+                        if auto_redirected:
+                            # Use the auto-redirected page as-is
+                            blocked = False
                 else:
                     # Hard block — give a grace period anyway in case of partial challenge
                     try:
@@ -262,7 +275,20 @@ class OzonParser(BaseParser):
             await natural_scroll(page, total_px=random.randint(800, 1800))
             await random_dwell(0.6, 1.2)
 
+            # Give product tiles a bit more time to populate (lazy-load after scroll)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+
             html = await page.content()
+            has_widget = '"searchResultsV2"' in html or "searchResultsV2" in html
+            has_product_links = "/product/" in html
+            logger.info(
+                "Ozon '%s' page ready: html=%d bytes, API payloads=%d, "
+                "has_widget=%s, has_product_links=%s, url=%s",
+                cat_name, len(html), len(intercepted), has_widget, has_product_links, page.url,
+            )
             products: list[Product] = []
 
             # 1) Prefer intercepted API payloads (most reliable)
