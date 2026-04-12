@@ -31,19 +31,7 @@ jobs:
           sudo sysctl -w net.ipv4.tcp_window_scaling=1 || true
           sudo sysctl -w net.ipv4.tcp_timestamps=1 || true
           sudo sysctl -w net.ipv4.tcp_sack=1 || true
-          # MSS ~1460 via standard MTU 1500 (default); ensure interface MTU is not set lower
           ip link show | head -20 || true
-
-      - name: Setup Tor proxy (free Russian IP)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq tor
-          # Force Russian exit nodes so Ozon sees a Russian IP
-          echo "ExitNodes {ru}" | sudo tee -a /etc/tor/torrc
-          echo "StrictNodes 1" | sudo tee -a /etc/tor/torrc
-          sudo service tor restart
-          sleep 5
-          echo "Tor is running on socks5://127.0.0.1:9050"
 
       - name: Restore price history DB
         uses: actions/cache@v4
@@ -138,7 +126,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          OZON_PROXY_URL: ${{ secrets.OZON_PROXY_URL || 'socks5://127.0.0.1:9050' }}
+          OZON_PROXY_URL: ${{ secrets.OZON_PROXY_URL }}
           ANOMALY_THRESHOLD_PERCENT: "60"
           LOG_LEVEL: "INFO"
         run: python -m src.main --once
