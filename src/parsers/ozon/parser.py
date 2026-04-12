@@ -199,13 +199,23 @@ class OzonParser(BaseParser):
                 await page.set_extra_http_headers({"referer": referer})
 
             logger.info("Ozon: navigate category '%s' (%s)", cat_name, url)
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             status = resp.status if resp else 0
-            if status in (403, 429):
-                logger.warning("Ozon returned %d for '%s'", status, cat_name)
-                if proxy_record is not None:
-                    proxy_record.mark_failure()
-                return []
+            blocked = status in (403, 429)
+            if blocked:
+                # Log body snippet so we can see if this is a WAF challenge page or hard reject
+                try:
+                    body = await resp.text()
+                    snippet = (body or "")[:400].replace("\n", " ")
+                    logger.warning("Ozon %d body snippet: %s", status, snippet)
+                except Exception as e:
+                    logger.warning("Ozon %d (body read failed: %s)", status, e)
+                # Give challenge JS a chance to run + API payloads to arrive
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                except Exception:
+                    pass
+                await random_dwell(2.0, 4.0)
 
             # Human-like interaction to trigger lazy-load + viewport checks
             await random_dwell(1.0, 2.0)
@@ -241,8 +251,12 @@ class OzonParser(BaseParser):
 
             if deduped and proxy_record is not None:
                 proxy_record.mark_success()
+            elif not deduped and blocked and proxy_record is not None:
+                # Still got 403 and no data — burn the proxy slot
+                proxy_record.mark_failure()
 
-            logger.info("Ozon '%s': %d products", cat_name, len(deduped))
+            logger.info("Ozon '%s': %d products%s", cat_name, len(deduped),
+                        " (from blocked page)" if deduped and blocked else "")
             return deduped
         except Exception as e:
             msg = str(e)

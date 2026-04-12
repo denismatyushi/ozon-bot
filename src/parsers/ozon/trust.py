@@ -18,7 +18,7 @@ WARMUP_QUERIES = [
 ]
 
 
-async def warmup_via_yandex(page, timeout_ms: int = 25_000) -> bool:
+async def warmup_via_yandex(page, timeout_ms: int = 45_000) -> bool:
     """Open Yandex, search, click first Ozon result → page arrives with organic referrer."""
     query = random.choice(WARMUP_QUERIES)
     try:
