@@ -161,6 +161,108 @@ class OzonParser(BaseParser):
         await ctx.add_init_script(STEALTH_JS)
         return ctx
 
+    async def _solve_challenge(self, page, url: str, cat_name: str) -> bool:
+        """Try several strategies to pass the Antibot challenge.
+
+        Returns True if we're still blocked afterwards, False if we've landed
+        on a real (non-challenge) page.
+        """
+        logger.info("Ozon: solving Antibot challenge for '%s'", cat_name)
+        start_url = page.url
+
+        async def _on_real_page() -> bool:
+            """Heuristic: are we on a real category page, not a challenge?"""
+            try:
+                body = await page.content()
+                if "Antibot" in body[:3000] or "abt-complaints" in body[:3000]:
+                    return False
+                # Has at least some category-looking content
+                return "/product/" in body or "searchResultsV2" in body
+            except Exception:
+                return False
+
+        # Strategy 1: wait up to 30s for JS-driven auto-redirect. Perform occasional
+        # human activity so the anti-bot watchdog sees engagement.
+        deadline = asyncio.get_event_loop().time() + 30
+        while asyncio.get_event_loop().time() < deadline:
+            await random_dwell(1.5, 3.0)
+            try:
+                await human_viewport_tour(page, n_moves=random.randint(1, 2))
+            except Exception:
+                pass
+            if page.url != start_url:
+                logger.info("Ozon: challenge redirected to %s", page.url)
+                break
+            if await _on_real_page():
+                logger.info("Ozon: challenge resolved in place (%s)", page.url)
+                break
+
+        if await _on_real_page():
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+            return False
+
+        # Strategy 2: try to click any "continue"/"I'm human" button on the challenge page.
+        click_selectors = [
+            "button:has-text('Продолжить')",
+            "button:has-text('Я не робот')",
+            "button:has-text('Перейти')",
+            "input[type=submit]",
+            "a.btn",
+            "a[href*='category']",
+        ]
+        for sel in click_selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    logger.info("Ozon: clicking challenge element %s", sel)
+                    await el.click(timeout=5_000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=15_000)
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                continue
+
+        if await _on_real_page():
+            return False
+
+        # Strategy 3: reload the page — cookie set by challenge JS often only
+        # takes effect on a fresh request. Keep the same context (same cookies).
+        try:
+            logger.info("Ozon: reloading after challenge")
+            resp = await page.reload(wait_until="domcontentloaded", timeout=45_000)
+            await random_dwell(1.5, 3.0)
+            if resp and resp.status not in (403, 429):
+                return False
+            if await _on_real_page():
+                return False
+        except Exception as e:
+            logger.warning("Ozon reload failed: %s", e)
+
+        # Strategy 4: goto original URL fresh with Yandex referer
+        try:
+            logger.info("Ozon: final retry goto")
+            resp = await page.goto(url, wait_until="domcontentloaded",
+                                   timeout=45_000, referer="https://yandex.ru/")
+            if resp and resp.status not in (403, 429):
+                return False
+            if await _on_real_page():
+                return False
+            try:
+                body = (await resp.text() or "")[:200] if resp else ""
+                logger.warning("Ozon still blocked after all strategies: %s",
+                               body.replace("\n", " "))
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("Ozon final retry failed: %s", e)
+
+        return True  # still blocked
+
     async def _scan_category_once(self, category: dict, proxy_record: ProxyRecord | None) -> list[Product]:
         cat_id = category["id"]
         cat_name = category["name"]
@@ -218,56 +320,7 @@ class OzonParser(BaseParser):
                 logger.warning("Ozon %d (challenge=%s): %s", status, is_challenge, snippet)
 
                 if is_challenge:
-                    # Solve Ozon Antibot challenge: let JS compute token + set cookie,
-                    # generate some user activity, then retry navigation.
-                    logger.info("Ozon: solving Antibot challenge for '%s'", cat_name)
-                    # 1) Let challenge JS finish
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=15_000)
-                    except Exception:
-                        pass
-                    await random_dwell(2.0, 4.0)
-                    # 2) Human activity — challenge JS often watches for real mouse events
-                    await human_viewport_tour(page, n_moves=random.randint(3, 5))
-                    await random_dwell(1.0, 2.5)
-
-                    current = page.url
-                    # Auto-redirect to ?__rr=N means Ozon validated our token and
-                    # navigated us to the real target — STAY THERE, don't reload.
-                    auto_redirected = (
-                        "ozon.ru" in current
-                        and "abt" not in current
-                        and current.rstrip("/") != url.rstrip("/")
-                    )
-                    if auto_redirected:
-                        logger.info("Ozon: challenge passed, staying on %s", current)
-                        blocked = False
-                        # Let dynamic content finish populating
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=10_000)
-                        except Exception:
-                            pass
-                    else:
-                        # Still on the challenge page — retry clean URL; cookie should ride
-                        logger.info("Ozon: re-navigating after challenge")
-                        try:
-                            resp2 = await page.goto(
-                                url, wait_until="domcontentloaded",
-                                timeout=60_000, referer="https://yandex.ru/",
-                            )
-                            status = resp2.status if resp2 else 0
-                            logger.info("Ozon: retry status=%d, final URL=%s", status, page.url)
-                            if status not in (403, 429):
-                                blocked = False
-                            else:
-                                try:
-                                    body2 = (await resp2.text() or "")[:200]
-                                    logger.warning("Ozon still blocked after challenge: %s",
-                                                   body2.replace("\n", " "))
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            logger.warning("Ozon retry after challenge failed: %s", e)
+                    blocked = await self._solve_challenge(page, url, cat_name)
                 else:
                     # Hard block — give a grace period anyway in case of partial challenge
                     try:
