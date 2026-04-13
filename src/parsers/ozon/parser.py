@@ -17,6 +17,7 @@ import json
 import logging
 import random
 import socket
+import urllib.parse
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -169,63 +170,96 @@ class OzonParser(BaseParser):
     ) -> list[Product]:
         """Hit Ozon's composer-api JSON endpoint directly via curl_cffi.
 
-        The frontend calls this endpoint — it returns the same widget data as
-        the HTML page. With Chrome TLS/JA4 impersonation the request often
-        bypasses the JS Antibot challenge entirely, because the challenge is
-        triggered by browser-side fingerprinting, not TLS.
+        Strategy:
+          1. GET ozon.ru homepage first — lets curl_cffi's session jar collect
+             `__Secure-ETC`, `abt_data` and other session cookies that the API
+             endpoint checks. Without this step the API returns the same
+             Antibot challenge HTML as the regular page load.
+          2. GET the composer-api / entrypoint-api JSON endpoints with
+             established cookies. These are the same endpoints the frontend
+             fires via XHR, and they bypass the JS challenge if the TLS/JA4
+             fingerprint matches Chrome (via curl_cffi chrome124 impersonation).
+          3. Also try the /search/?text= endpoint as a secondary probe — if
+             category page is guarded, search sometimes isn't.
 
-        Returns products if API path works. On any failure returns [] and the
-        caller falls back to Playwright.
+        Returns products on success. On any failure returns [] so the caller
+        falls back to Playwright.
         """
         if not CURL_CFFI_AVAILABLE:
+            logger.warning("Ozon API-first skipped: curl_cffi not available")
             return []
 
         slug = category["slug"]
         cat_name = category["name"]
         cat_path = f"/category/{slug}/"
 
-        # Two known endpoint hosts — try both
         endpoints = [
             f"https://www.ozon.ru/api/composer-api.bx/page/json/v2?url={cat_path}",
             f"https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url={cat_path}",
+            # Search fallback — often less guarded than category pages
+            f"https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=/search/?text={urllib.parse.quote(cat_name)}&from_global=true",
         ]
 
         proxy = proxy_record.url if proxy_record else None
-        referer = f"https://www.ozon.ru{cat_path}"
+        logger.info(
+            "Ozon API-first '%s' [v2] proxy=%s",
+            cat_name, "yes" if proxy else "direct",
+        )
 
         extra_headers = {
             "accept": "application/json",
             "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
             "x-o3-app-name": "dweb_client",
-            "x-o3-app-version": "release_9-6-2025_...",
             "x-o3-page-type": "category",
-            "x-o3-sample-trace": "false",
         }
 
         try:
             async with ImpersonatedClient(proxy=proxy, impersonate="chrome124") as client:
+                # Step 1: warm up session cookies
+                try:
+                    warm = await client.get("https://www.ozon.ru/")
+                    wstatus = getattr(warm, "status_code", 0)
+                    wtext = getattr(warm, "text", "") or ""
+                    is_challenge = (
+                        "Antibot" in wtext[:3000] or "abt-complaints" in wtext[:3000]
+                    )
+                    logger.info(
+                        "Ozon API-first '%s' warmup: status=%d len=%d challenge=%s",
+                        cat_name, wstatus, len(wtext), is_challenge,
+                    )
+                    # Even on challenge HTML, cookies might be set — proceed anyway
+                except Exception as e:
+                    logger.info("Ozon API-first '%s' warmup failed: %s", cat_name, e)
+
+                # Step 2: hit API endpoints with established cookies
+                referer = f"https://www.ozon.ru{cat_path}"
                 for url in endpoints:
                     try:
                         resp = await client.get(
-                            url,
-                            referer=referer,
-                            extra_headers=extra_headers,
+                            url, referer=referer, extra_headers=extra_headers,
                         )
                         status = getattr(resp, "status_code", 0)
                         text = getattr(resp, "text", "") or ""
+                        tag = url.split("?")[0].rsplit("/", 2)[-2:]
                         logger.info(
                             "Ozon API-first '%s' %s: status=%d len=%d",
-                            cat_name, url.split("?")[0].split("/")[-1], status, len(text),
+                            cat_name, "/".join(tag), status, len(text),
                         )
                         if status != 200 or not text:
                             continue
                         if "Antibot" in text[:3000] or "abt-complaints" in text[:3000]:
-                            logger.info("Ozon API-first '%s': got challenge page", cat_name)
+                            logger.info(
+                                "Ozon API-first '%s': got challenge page from API",
+                                cat_name,
+                            )
                             continue
                         try:
                             payload = json.loads(text)
                         except Exception as e:
-                            logger.info("Ozon API-first '%s': non-JSON body (%s)", cat_name, e)
+                            logger.info(
+                                "Ozon API-first '%s': non-JSON body (%s)",
+                                cat_name, e,
+                            )
                             continue
                         products = extract_from_api_payload(payload, category=cat_name)
                         logger.info(
@@ -235,7 +269,10 @@ class OzonParser(BaseParser):
                         if products:
                             return products
                     except Exception as e:
-                        logger.info("Ozon API-first '%s' endpoint failed: %s", cat_name, e)
+                        logger.info(
+                            "Ozon API-first '%s' endpoint failed: %s",
+                            cat_name, e,
+                        )
                         continue
         except Exception as e:
             logger.info("Ozon API-first '%s' client failed: %s", cat_name, e)
