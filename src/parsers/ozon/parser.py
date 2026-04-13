@@ -25,9 +25,10 @@ from src.parsers.base import BaseParser
 
 from .categories import OZON_CATEGORIES
 from .extractor import extract_from_api_payload, extract_from_html
+from .http_client import CURL_CFFI_AVAILABLE, ImpersonatedClient
 from .human import bezier_mouse_move, human_viewport_tour, natural_scroll, random_dwell
 from .proxy_pool import ProxyPool, ProxyRecord
-from .stealth import CHROME_UA, STEALTH_JS, build_context_kwargs
+from .stealth import CHROME_UA, CLIENT_HINTS_HEADERS, STEALTH_JS, build_context_kwargs
 from .trust import warmup_via_yandex
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,86 @@ class OzonParser(BaseParser):
         # Inject stealth BEFORE any page JS runs
         await ctx.add_init_script(STEALTH_JS)
         return ctx
+
+    async def _try_api_first(
+        self,
+        category: dict,
+        proxy_record: ProxyRecord | None,
+    ) -> list[Product]:
+        """Hit Ozon's composer-api JSON endpoint directly via curl_cffi.
+
+        The frontend calls this endpoint — it returns the same widget data as
+        the HTML page. With Chrome TLS/JA4 impersonation the request often
+        bypasses the JS Antibot challenge entirely, because the challenge is
+        triggered by browser-side fingerprinting, not TLS.
+
+        Returns products if API path works. On any failure returns [] and the
+        caller falls back to Playwright.
+        """
+        if not CURL_CFFI_AVAILABLE:
+            return []
+
+        slug = category["slug"]
+        cat_name = category["name"]
+        cat_path = f"/category/{slug}/"
+
+        # Two known endpoint hosts — try both
+        endpoints = [
+            f"https://www.ozon.ru/api/composer-api.bx/page/json/v2?url={cat_path}",
+            f"https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url={cat_path}",
+        ]
+
+        proxy = proxy_record.url if proxy_record else None
+        referer = f"https://www.ozon.ru{cat_path}"
+
+        extra_headers = {
+            "accept": "application/json",
+            "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "x-o3-app-name": "dweb_client",
+            "x-o3-app-version": "release_9-6-2025_...",
+            "x-o3-page-type": "category",
+            "x-o3-sample-trace": "false",
+        }
+
+        try:
+            async with ImpersonatedClient(proxy=proxy, impersonate="chrome124") as client:
+                for url in endpoints:
+                    try:
+                        resp = await client.get(
+                            url,
+                            referer=referer,
+                            extra_headers=extra_headers,
+                        )
+                        status = getattr(resp, "status_code", 0)
+                        text = getattr(resp, "text", "") or ""
+                        logger.info(
+                            "Ozon API-first '%s' %s: status=%d len=%d",
+                            cat_name, url.split("?")[0].split("/")[-1], status, len(text),
+                        )
+                        if status != 200 or not text:
+                            continue
+                        if "Antibot" in text[:3000] or "abt-complaints" in text[:3000]:
+                            logger.info("Ozon API-first '%s': got challenge page", cat_name)
+                            continue
+                        try:
+                            payload = json.loads(text)
+                        except Exception as e:
+                            logger.info("Ozon API-first '%s': non-JSON body (%s)", cat_name, e)
+                            continue
+                        products = extract_from_api_payload(payload, category=cat_name)
+                        logger.info(
+                            "Ozon API-first '%s': %d products from JSON",
+                            cat_name, len(products),
+                        )
+                        if products:
+                            return products
+                    except Exception as e:
+                        logger.info("Ozon API-first '%s' endpoint failed: %s", cat_name, e)
+                        continue
+        except Exception as e:
+            logger.info("Ozon API-first '%s' client failed: %s", cat_name, e)
+
+        return []
 
     async def _solve_challenge(self, page, url: str, cat_name: str) -> bool:
         """Try several strategies to pass the Antibot challenge.
@@ -406,6 +487,20 @@ class OzonParser(BaseParser):
                 pass
 
     async def _scan_category_with_retries(self, category: dict, max_attempts: int = 3) -> list[Product]:
+        # Fast path: try Ozon JSON API first via curl_cffi chrome124 impersonation.
+        # Attempt with proxy, then direct, before spinning up heavy Playwright.
+        api_proxy = self.pool.acquire() if self.pool else None
+        products = await self._try_api_first(category, api_proxy)
+        if products:
+            if api_proxy is not None:
+                api_proxy.mark_success()
+            return products
+        # Try direct (no proxy) if proxy attempt returned nothing
+        if api_proxy is not None:
+            products = await self._try_api_first(category, None)
+            if products:
+                return products
+
         proxy_unreachable_streak = 0
         for attempt in range(1, max_attempts + 1):
             # After 2 consecutive proxy connection failures, try without proxy
