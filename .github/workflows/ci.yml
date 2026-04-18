@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiogram aiohttp pydantic pydantic-settings aiosqlite "apscheduler>=3.10,<4.0" python-dotenv
+
+      - name: Byte-compile sources
+        run: python -m compileall -q src config
+
+      - name: Import smoke-test
+        env:
+          TELEGRAM_BOT_TOKEN: "dummy-token-for-import-test"
+        run: |
+          python - <<'PY'
+          from config.settings import settings
+          from src import main
+          from src.handlers import start, placement, vocab, grammar, lesson, progress, settings as s
+          from src.content import vocabulary, grammar as g, placement as p, levels
+          print("imports OK")
+          print(f"vocab entries: {len(vocabulary.ALL_WORDS)}")
+          print(f"grammar lessons: {len(g.LESSONS)}")
+          print(f"placement Qs: {len(p.QUESTIONS)}")
+          PY
